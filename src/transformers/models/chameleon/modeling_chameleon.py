@@ -60,6 +60,63 @@ _SEQ_CLASS_EXPECTED_LOSS = 1.03
 _SEQ_CLASS_EXPECTED_OUTPUT = "'LABEL_0'"
 
 
+class TokenizerShortcut(nn.Module):
+    def __init__(self, dim1, dim2, type="nn", hidden_dim=1024, apply_softmax=False, temperature=1.0):
+        """
+        Custom class implemented to propagate gradients through tokenization
+        """
+        super().__init__()
+        self.type = type
+        self.device = "cpu"
+        if type == "nn":
+            self.model = nn.Sequential(
+                nn.Linear(dim1, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, dim2),
+            )
+        elif type == "linear":
+            self.model = nn.Linear(dim1, dim2)
+
+        self.apply_softmax = apply_softmax
+        self.temperature = temperature
+
+        if self.apply_softmax is True and self.temperature is None:
+            raise ValueError("You must set a temperature if you want to apply softmax in ShortcutModel.")
+
+    def _softmax_with_temperature(self, logits):
+        """
+        Apply the softmax function with temperature on the input logits.
+        Parameters:
+        - logits (torch.Tensor): The input logits.
+        - temperature (float): The temperature parameter to scale the logits.
+        Returns:
+        - torch.Tensor: The softmax probabilities.
+        """
+        return torch.nn.functional.softmax(logits / self.temperature, dim=-1)
+
+    def forward(self, x):
+        embedding = self.model(x)
+        if self.type == "nn" and self.apply_softmax:
+            return self._softmax_with_temperature(embedding)
+        return embedding
+
+    def to(self, device=None, dtype=None):
+        # Move each layer of the model to the specified device
+        if device is not None:
+            for param in self.model.parameters():
+                param.data = param.data.to(device)
+            self.device = device
+
+        # Convert the model's parameters to the specified dtype
+        if dtype is not None:
+            for param in self.model.parameters():
+                param.data = param.data.to(dtype)
+
+        return self
+
+
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Chameleon
 class ChameleonRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -1203,7 +1260,7 @@ class ChameleonModel(ChameleonPreTrainedModel):
         config: ChameleonConfig
     """
 
-    def __init__(self, config: ChameleonConfig):
+    def __init__(self, config: ChameleonConfig, shortcut_type=None, softmax_temperature=None):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1217,6 +1274,28 @@ class ChameleonModel(ChameleonPreTrainedModel):
         self.norm = ChameleonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.vqmodel = ChameleonVQVAE(config.vq_config)
         self.gradient_checkpointing = False
+
+        #### START CUSTOM CODE FOR IMAGE JAILBREAKS ####
+        self.shortcut_type = shortcut_type
+
+        self.softmax = nn.Softmax(dim=-1)
+
+        if shortcut_type == "embed":
+            self.shortcut = TokenizerShortcut(dim1=self.vqmodel.quantize.embedding_dim, dim2=config.hidden_size)
+        elif shortcut_type == "embed-linear":
+            self.shortcut = TokenizerShortcut(
+                dim1=self.vqmodel.quantize.embedding_dim, dim2=config.hidden_size, type="linear"
+            )
+        elif shortcut_type == "vocab":
+            self.shortcut = TokenizerShortcut(
+                dim1=self.vqmodel.quantize.embedding_dim,
+                dim2=config.vocab_size,
+                apply_softmax=False if softmax_temperature is None else True,
+                temperature=softmax_temperature,
+            )
+        elif shortcut_type is not None:
+            raise ValueError("The specified shortcut does not exist")
+        #### END CUSTOM CODE FOR IMAGE JAILBREAKS ####
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1238,10 +1317,10 @@ class ChameleonModel(ChameleonPreTrainedModel):
                 The tensors corresponding to the input images.
         """
         batch_size = pixel_values.shape[0]
-        _, _, image_toks = self.vqmodel.encode(pixel_values)
+        embed, _, image_toks = self.vqmodel.encode(pixel_values)
         bpe_toks = self.vocabulary_mapping.convert_img2bpe(image_toks)
         bpe_toks = bpe_toks.view(batch_size, -1)
-        return bpe_toks
+        return embed.permute(0, 2, 3, 1).view(-1, 1024, self.vqmodel.quantize.embedding_dim), bpe_toks
 
     @add_start_docstrings_to_model_forward(CHAMELEON_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
@@ -1263,6 +1342,8 @@ class ChameleonModel(ChameleonPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        use_shortcut: bool = False,
+        output_vqembeds=False,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1288,13 +1369,36 @@ class ChameleonModel(ChameleonPreTrainedModel):
             )
 
         if pixel_values is not None:
-            image_tokens = self.get_image_tokens(pixel_values)
+            vq_embeds, image_tokens = self.get_image_tokens(pixel_values)
             special_image_mask = input_ids == self.vocabulary_mapping.image_token_id
             image_tokens = image_tokens.to(input_ids.device, input_ids.dtype)
             input_ids = input_ids.masked_scatter(special_image_mask, image_tokens)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+
+        if pixel_values is not None and use_shortcut:
+            if "embed" in self.shortcut_type:
+                shortcut_embedding = self.shortcut(vq_embeds)
+            elif self.shortcut_type == "vocab":
+                shortcut_vocab = self.shortcut(vq_embeds)
+                # shortcut_vocab = self.softmax(shortcut_vocab)
+                shortcut_embedding = shortcut_vocab.to(self.embed_tokens.weight.device) @ self.embed_tokens.weight
+            else:
+                raise NotImplementedError("Shortcut type not recognized")
+
+            # inputs_embeds[special_image_mask] = shortcut_embedding.to(inputs_embeds.device)
+            start_indices = torch.argmax(special_image_mask.int(), dim=1)
+            # Create a range tensor of size 1024
+            range_tensor = torch.arange(1024, device=inputs_embeds.device)
+            # Expand start_indices to match the range_tensor shape
+            expanded_start_indices = start_indices[:, None] + range_tensor[None, :]
+            # Use advanced indexing to set the values
+            inputs_embeds.scatter_(
+                1,
+                expanded_start_indices.unsqueeze(2).expand(-1, -1, inputs_embeds.size(2)),
+                shortcut_embedding.to(inputs_embeds.device),
+            )
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1361,8 +1465,24 @@ class ChameleonModel(ChameleonPreTrainedModel):
         if use_cache:
             next_cache = next_decoder_cache
 
+        if use_shortcut and output_vqembeds:
+            return (
+                BaseModelOutputWithPast(
+                    last_hidden_state=hidden_states,
+                    past_key_values=next_cache,
+                    hidden_states=all_hidden_states,
+                    attentions=all_self_attns,
+                ),
+                vq_embeds,
+                shortcut_embedding,
+            )
+
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return (
+                tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None),
+                vq_embeds,
+                shortcut_embedding,
+            )
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -1501,9 +1621,9 @@ class ChameleonModel(ChameleonPreTrainedModel):
 class ChameleonForConditionalGeneration(ChameleonPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, shortcut_type=None, softmax_temperature=1.0):
         super().__init__(config)
-        self.model = ChameleonModel(config)
+        self.model = ChameleonModel(config, shortcut_type, softmax_temperature)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1544,6 +1664,8 @@ class ChameleonForConditionalGeneration(ChameleonPreTrainedModel, GenerationMixi
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        use_shortcut: bool = False,
+        output_vqembeds: bool = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1593,7 +1715,15 @@ class ChameleonForConditionalGeneration(ChameleonPreTrainedModel, GenerationMixi
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            use_shortcut=use_shortcut,
+            output_vqembeds=output_vqembeds,
         )
+
+        vq_embeds = None
+        if isinstance(outputs, tuple):
+            vq_embeds = outputs[1]
+            shortcut_embeds = outputs[-2]
+            outputs = outputs[0]
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
@@ -1619,6 +1749,19 @@ class ChameleonForConditionalGeneration(ChameleonPreTrainedModel, GenerationMixi
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
+
+        if use_shortcut and output_vqembeds:
+            return (
+                CausalLMOutputWithPast(
+                    loss=loss,
+                    logits=logits,
+                    past_key_values=outputs.past_key_values,
+                    hidden_states=outputs.hidden_states,
+                    attentions=outputs.attentions,
+                ),
+                vq_embeds,
+                shortcut_embeds,
+            )
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -1674,6 +1817,7 @@ class ChameleonForConditionalGeneration(ChameleonPreTrainedModel, GenerationMixi
                 "past_key_values": past_key_values,
                 "use_cache": use_cache,
                 "attention_mask": attention_mask,
+                **kwargs,
             }
         )
         return model_inputs
