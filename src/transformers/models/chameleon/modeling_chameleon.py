@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Edits for the paper "Gradient-based Jailbreak Images for Multimodal Fusion Models"
+# are under Copyright (c) Meta Platforms, Inc. and affiliates.
 """PyTorch Chameleon model."""
 
 import math
